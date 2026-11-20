@@ -39,6 +39,11 @@ jobs:
           key: ${{ runner.os }}-maven-${{ hashFiles('**/pom.xml') }}
       - name: Compile Application
         run: mvn clean compile
+      - name: Upload Compiled Workspace
+        uses: actions/upload-artifact@v7
+        with:
+          name: compiled-workspace
+          path: .
 
   codereview:
     name: code review
