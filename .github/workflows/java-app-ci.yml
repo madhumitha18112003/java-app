@@ -10,11 +10,11 @@ jobs:
   build: # this is the name of the job, you can name it anything
     runs-on: ubuntu-latest
     steps:
-      - name: clone the git repository
-        # run: |
-        #   apt update
-        #   apt install git -y
-        #   git clone https://github.com/nareshwart/java-app.git
+      # - name: clone the git repository
+      #   # run: |
+      #   #   apt update
+      #   #   apt install git -y
+      #   #   git clone https://github.com/nareshwart/java-app.git
       - uses: actions/checkout@v4
       - name: Set up JDK 21
         uses: actions/setup-java@v5
