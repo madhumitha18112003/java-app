@@ -1,25 +1,381 @@
-name: Java App CI
-
-on: # on which events the workflow will run/pipeline will be triggered
+name: Java Application CI/CD
+on:
+  push:
+    branches:
+      - main
   workflow_dispatch:
-  # push:
-  #   branches: [ "main" ]
-  # pull_request:
-  #   branches: [ "main" ]
+
 jobs:
-  build: # this is the name of the job, you can name it anything
+  checkout:
+    name: Checkout
     runs-on: ubuntu-latest
     steps:
-      # - name: clone the git repository
-      #   # run: |
-      #   #   apt update
-      #   #   apt install git -y
-      #   #   git clone https://github.com/nareshwart/java-app.git
-      - uses: actions/checkout@v4
-      - name: Set up JDK 21
+      - name: Checkout Source Code
+        uses: actions/checkout@v6
+      - name: Upload Workspace
+        uses: actions/upload-artifact@v7
+        with:
+          name: source-code
+          path: .
+
+  compile:
+    name: Compile
+    runs-on: ubuntu-latest
+    needs: checkout
+    steps:
+      - name: Download Source Code
+        uses: actions/download-artifact@v8
+        with:
+          name: source-code
+      - name: Setup JDK 21
         uses: actions/setup-java@v5
         with:
-          java-version: '21'
           distribution: 'temurin'
-      - name: Build with Maven
-        run: mvn clean install
+          java-version: '21'
+      - name: Setup Maven Cache
+        uses: actions/cache@v6
+        with:
+          path: ~/.m2/repository
+          key: ${{ runner.os }}-maven-${{ hashFiles('**/pom.xml') }}
+      - name: Compile Application
+        run: mvn clean compile
+
+  codereview:
+    name: code review
+    runs-on: ubuntu-latest
+    needs: compile
+    steps:
+      - name: Download Compiled Workspace
+        uses: actions/download-artifact@v8
+        with:
+          name: compiled-workspace
+      - name: Setup JDK 21
+        uses: actions/setup-java@v5
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+      - name: Run Checkstyle
+        run: mvn checkstyle:checkstyle
+      - name: Upload Checkstyle Report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: checkstyle-html-report
+          path: |
+            target/site/checkstyle.html
+            target/site/css/
+      - name: Add Checkstyle Summary
+        if: always()
+        run: |
+          python3 - <<'PY'
+          import xml.etree.ElementTree as ET
+          import os
+          from pathlib import Path
+
+          summary = ["## Checkstyle results", ""]
+          report = Path("target/checkstyle-result.xml")
+          if report.is_file():
+              counts = {severity: 0 for severity in ("error", "warning", "info", "ignore")}
+              root = ET.parse(report).getroot()
+              for issue in root.iter("error"):
+                  severity = issue.get("severity")
+                  if severity in counts:
+                      counts[severity] += 1
+              total = sum(counts.values())
+              summary.extend([
+                  "| Total | Errors | Warnings | Info | Ignored |",
+                  "| ---: | ---: | ---: | ---: | ---: |",
+                  f"| {total} | {counts['error']} | {counts['warning']} | {counts['info']} | {counts['ignore']} |",
+                  "",
+              ])
+          else:
+              summary.extend(["Checkstyle XML results were not generated.", ""])
+
+          summary.append("See the **Published reports** section below for a direct HTML link after deployment.")
+
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as output:
+              output.write("\n".join(summary) + "\n")
+          PY
+
+  unit-test:
+    name: Unit Test
+    runs-on: ubuntu-latest
+    needs: compile
+    steps:
+      - name: Download Compiled Workspace
+        uses: actions/download-artifact@v8
+        with:
+          name: compiled-workspace
+      - name: Setup JDK 21
+        uses: actions/setup-java@v5
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+      - name: Run Unit Tests
+        id: unit-tests
+        run: mvn test
+      - name: Generate HTML Unit Test Report
+        if: always()
+        run: mvn org.apache.maven.plugins:maven-surefire-report-plugin:3.0.0:report-only
+      - name: Add Unit Test Summary
+        if: always()
+        env:
+          TEST_OUTCOME: ${{ steps.unit-tests.outcome }}
+        run: |
+          python3 - <<'PY'
+          import glob
+          import os
+          import xml.etree.ElementTree as ET
+
+          reports = sorted(glob.glob("target/surefire-reports/TEST-*.xml"))
+          summary = ["## Unit test results", "", f"Test command: **{os.environ['TEST_OUTCOME']}**", ""]
+
+          if reports:
+              totals = {key: 0 for key in ("tests", "failures", "errors", "skipped")}
+              for report in reports:
+                  root = ET.parse(report).getroot()
+                  suites = [root] if root.tag == "testsuite" else root.findall(".//testsuite")
+                  for suite in suites:
+                      for key in totals:
+                          totals[key] += int(suite.get(key, "0"))
+
+              summary.extend([
+                  "| Tests | Passed | Failures | Errors | Skipped |",
+                  "| ---: | ---: | ---: | ---: | ---: |",
+                  f"| {totals['tests']} | {totals['tests'] - totals['failures'] - totals['errors'] - totals['skipped']} | {totals['failures']} | {totals['errors']} | {totals['skipped']} |",
+              ])
+          else:
+              summary.append("No Surefire XML reports were generated.")
+
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as output:
+              output.write("\n".join(summary) + "\n")
+          PY
+
+      - name: Upload Test Reports
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: junit-test-reports
+          path: target/surefire-reports/
+      - name: Upload HTML Test Report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: surefire-html-report
+          path: target/site/
+      - name: Upload Tested Workspace
+        uses: actions/upload-artifact@v7
+        with:
+          name: tested-workspace
+          path: .
+
+  coverage:
+    name: Code Coverage
+    runs-on: ubuntu-latest
+    needs: unit-test
+    steps:
+      - name: Download Tested Workspace
+        uses: actions/download-artifact@v8
+        with:
+          name: tested-workspace
+      - name: Setup JDK 21
+        uses: actions/setup-java@v5
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: Generate JaCoCo Coverage
+        run: mvn jacoco:report
+
+      - name: Add Coverage Summary
+        if: always()
+        run: |
+          python3 - <<'PY'
+          import os
+          import xml.etree.ElementTree as ET
+          from pathlib import Path
+
+          report = Path("target/site/jacoco/jacoco.xml")
+          summary = ["## Code coverage", ""]
+
+          if report.is_file():
+              root = ET.parse(report).getroot()
+              summary.extend([
+                  "| Metric | Coverage | Visual |",
+                  "| --- | ---: | --- |",
+              ])
+              for metric, label in (("LINE", "Lines"), ("BRANCH", "Branches")):
+                  counter = root.find(f"counter[@type='{metric}']")
+                  if counter is None:
+                      continue
+                  missed = int(counter.get("missed", "0"))
+                  covered = int(counter.get("covered", "0"))
+                  total = missed + covered
+                  if total == 0:
+                      value, bar = "N/A", "N/A"
+                  else:
+                      percent = covered * 100 / total
+                      filled = round(percent / 5)
+                      value = f"{percent:.1f}%"
+                      bar = f"`{'#' * filled}{'.' * (20 - filled)}`"
+                  summary.append(f"| {label} | {value} | {bar} |")
+              summary.extend(["", "The `jacoco-coverage-report` artifact contains a ZIP of the full HTML report."])
+          else:
+              summary.append("JaCoCo XML report was not generated.")
+
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as output:
+              output.write("\n".join(summary) + "\n")
+          PY
+
+      - name: Upload Coverage Reports
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: jacoco-coverage-report
+          path: |
+            target/site/jacoco/
+            target/site/jacoco/jacoco.xml
+
+  publish-reports:
+    name: Publish Reports to GitHub Pages
+    runs-on: ubuntu-latest
+    needs:
+      - codereview
+      - unit-test
+      - coverage
+    if: needs.codereview.result == 'success' && needs.coverage.result == 'success'
+    concurrency:
+      group: github-pages
+      cancel-in-progress: false
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+
+      - name: Download Code Review HTML Report
+        uses: actions/download-artifact@v8
+        with:
+          name: codereview-html-report
+          path: report-site/codereview
+
+      - name: Download JaCoCo HTML Report
+        uses: actions/download-artifact@v8
+        with:
+          name: jacoco-coverage-report
+          path: report-site/jacoco
+
+      - name: Download Unit Test HTML Report
+        uses: actions/download-artifact@v8
+        with:
+          name: surefire-html-report
+          path: report-site/tests
+
+      - name: Create Reports Landing Page
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          Path("report-site/index.html").write_text(
+              """<!doctype html>
+          <html lang="en">
+          <head><meta charset="utf-8"><title>IT Services Portal Reports</title></head>
+          <body>
+            <h1>IT Services Portal Reports</h1>
+            <ul>
+              <li><a href="./checkstyle/checkstyle.html">Checkstyle report</a></li>
+              <li><a href="./tests/surefire-report.html">Unit test report</a></li>
+              <li><a href="./jacoco/index.html">JaCoCo coverage report</a></li>
+            </ul>
+          </body>
+          </html>
+          """,
+              encoding="utf-8",
+          )
+          PY
+
+      - name: Upload Pages Artifact
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: report-site
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v5
+
+      - name: Add Published Report Links to Summary
+        env:
+          PAGE_URL: ${{ steps.deployment.outputs.page_url }}
+        run: |
+          python3 - <<'PY'
+          import os
+
+          page_url = os.environ["PAGE_URL"].rstrip("/")
+          summary = [
+              "## Published reports",
+              "",
+              f"- [Checkstyle HTML report]({page_url}/checkstyle/checkstyle.html)",
+              f"- [Unit test HTML report]({page_url}/tests/surefire-report.html)",
+              f"- [JaCoCo coverage report]({page_url}/jacoco/)",
+          ]
+
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as output:
+              output.write("\n".join(summary) + "\n")
+          PY
+
+  package:
+
+    name: Package
+    runs-on: ubuntu-latest
+    needs:
+      - codereview
+      - coverage
+
+    steps:
+
+      - name: Download Tested Workspace
+        uses: actions/download-artifact@v8
+        with:
+          name: tested-workspace
+
+      - name: Setup JDK 21
+        uses: actions/setup-java@v5
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: Package Application
+        run: mvn package -DskipTests
+
+      - name: Upload Build Artifacts
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: application-artifacts
+          path: |
+            target/*.jar
+            target/*.war
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Build and Push Docker Image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ secrets.DOCKER_USERNAME }}/it-services-portal:latest
+            ${{ secrets.DOCKER_USERNAME }}/it-services-portal:${{ github.run_number }}
